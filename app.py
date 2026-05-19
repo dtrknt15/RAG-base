@@ -1,5 +1,5 @@
 # 必要なライブラリのインストールコマンド:
-# pip install streamlit langchain langchain-openai langchain-chroma pypdf
+# pip install streamlit langchain langchain-openai langchain-chroma langchain-community pypdf
 
 import streamlit as st
 import os
