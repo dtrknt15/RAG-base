@@ -23,10 +23,102 @@ dotenv.load_dotenv()
 # 以下のコードは変更なし
 # --- ページ設定 ---
 st.set_page_config(page_title="RAG Chatbot", page_icon="📄")
-st.title("📄 独自ドキュメント対応チャットボット (RAG)")
+
+# --- UIカスタムCSSの注入 ---
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800&family=Inter:wght@400;500;600&display=swap');
+
+/* 全体のフォント設定 */
+.stApp {
+    font-family: 'Inter', sans-serif;
+}
+
+/* タイトルのグラデーションとフォント */
+h1 {
+    font-family: 'Outfit', sans-serif !important;
+    font-weight: 800 !important;
+    background: linear-gradient(135deg, #6366f1, #06b6d4, #3b82f6) !important;
+    -webkit-background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+    padding-bottom: 10px !important;
+}
+
+/* チャットメッセージの見た目洗練 */
+div[data-testid="stChatMessage"] {
+    animation: slideUp 0.4s ease-out;
+    border-radius: 16px !important;
+    border: 1px solid rgba(0, 0, 0, 0.05) !important;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.02) !important;
+    margin-bottom: 16px !important;
+}
+
+/* サイドバーの背景トーン */
+section[data-testid="stSidebar"] {
+    background-color: #f8fafc !important;
+    border-right: 1px solid #f1f5f9 !important;
+}
+
+/* 参照元のアコーディオンをスタイリッシュに */
+div[data-testid="stExpander"] {
+    border: 1px solid rgba(0, 0, 0, 0.06) !important;
+    border-radius: 10px !important;
+    background-color: rgba(255, 255, 255, 0.4) !important;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.01) !important;
+}
+
+/* アニメーションキーフレーム */
+@keyframes slideUp {
+    from {
+        opacity: 0;
+        transform: translateY(12px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* Streamlitのデフォルトボタンホバー調整 */
+button[kind="secondary"] {
+    transition: all 0.25s ease !important;
+    border-radius: 8px !important;
+}
+button[kind="secondary"]:hover {
+    border-color: #6366f1 !important;
+    color: #6366f1 !important;
+    transform: translateY(-1px);
+}
+</style>
+""", unsafe_allow_html=True)
+
+# タイトルと会話クリアボタンのレイアウト
+col1, col2 = st.columns([0.75, 0.25])
+with col1:
+    st.title("📄 独自ドキュメント対応チャットボット (RAG)")
+with col2:
+    st.write("")  # 余白調整
+    st.write("")  # 余白調整
+    if st.button("🗑️ 会話クリア", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
 
 # --- 定数とヘルパー関数 ---
 PERSIST_DIR = "./chroma_db"
+
+@st.cache_data(show_spinner="利用可能なモデルを取得中...")
+def fetch_models(api_key, base_url):
+    if not api_key:
+        return ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"]
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=5.0)
+        models_list = client.models.list()
+        ids = [m.id for m in models_list.data]
+        return sorted(ids)
+    except Exception as e:
+        st.sidebar.warning(f"モデル一覧の取得に失敗しました (OpenAIのデフォルトモデルを表示します): {e}")
+        return ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"]
 
 def get_indexed_files():
     if st.session_state.vector_store is None:
@@ -43,6 +135,32 @@ def get_indexed_files():
     except Exception as e:
         return []
 
+def get_vector_store(api_key, base_url, embedding_model):
+    # すでに読み込み済みで設定が変わっていなければそのまま返す
+    if (st.session_state.vector_store is not None and
+        st.session_state.get("last_api_key") == api_key and
+        st.session_state.get("last_base_url") == base_url and
+        st.session_state.get("last_embedding_model") == embedding_model):
+        return st.session_state.vector_store
+
+    # 新しく読み込むか再初期化する
+    if api_key and os.path.exists(PERSIST_DIR) and len(os.listdir(PERSIST_DIR)) > 0:
+        try:
+            embeddings = OpenAIEmbeddings(model=embedding_model, api_key=api_key, base_url=base_url)
+            vector_store = Chroma(
+                persist_directory=PERSIST_DIR,
+                embedding_function=embeddings
+            )
+            st.session_state.vector_store = vector_store
+            st.session_state.last_api_key = api_key
+            st.session_state.last_base_url = base_url
+            st.session_state.last_embedding_model = embedding_model
+            return vector_store
+        except Exception as e:
+            st.sidebar.error(f"永続化インデックスの読込エラー: {e}")
+            return None
+    return st.session_state.vector_store
+
 # --- セッションステートの初期化 ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -55,17 +173,41 @@ with st.sidebar:
     default_api_key = os.environ.get("OPENAI_API_KEY", "")
     api_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...", value=default_api_key)
     
-    # ベクトルデータベースの自動読み込み
-    if api_key and st.session_state.vector_store is None:
-        if os.path.exists(PERSIST_DIR) and len(os.listdir(PERSIST_DIR)) > 0:
-            try:
-                embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=api_key)
-                st.session_state.vector_store = Chroma(
-                    persist_directory=PERSIST_DIR,
-                    embedding_function=embeddings
-                )
-            except Exception as e:
-                st.error(f"永続化インデックスの読込エラー: {e}")
+    default_base_url = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
+    base_url = st.text_input("Base URL", placeholder="https://api.openai.com/v1", value=default_base_url)
+    
+    embedding_model = st.text_input("埋め込みモデル名", value="text-embedding-3-small")
+    
+    use_custom_model = st.checkbox("カスタムモデル名を手動入力", value=False)
+    if use_custom_model:
+        selected_model = st.text_input("モデル名", value="gpt-4o-mini")
+    else:
+        models = fetch_models(api_key, base_url)
+        default_model = "gpt-4o-mini"
+        if default_model not in models and models:
+            default_model = models[0]
+        selected_model = st.selectbox(
+            "利用するモデル", 
+            options=models, 
+            index=models.index(default_model) if default_model in models else 0
+        )
+    
+    # ベクトルデータベースの自動読み込み/同期
+    if api_key:
+        get_vector_store(api_key, base_url, embedding_model)
+        
+    prompt_mode = st.radio(
+        "回答モード",
+        options=["厳格に文書回答", "一般知識も交える"],
+        index=0,
+        help="厳格モード：ドキュメント内の情報のみに基づいて回答します。\n一般知識併用モード：ドキュメントにない情報も一般知識から補完して回答します。"
+    )
+        
+    with st.expander("⚙️ 詳細RAG設定"):
+        chunk_size = st.slider("チャンクサイズ", min_value=100, max_value=3000, value=1000, step=100)
+        chunk_overlap = st.slider("重複サイズ (overlap)", min_value=0, max_value=500, value=100, step=10)
+        search_type = st.selectbox("検索タイプ", options=["similarity", "mmr"], index=0)
+        k_value = st.slider("取得ドキュメント数 (k)", min_value=1, max_value=10, value=4, step=1)
                 
     st.divider()
     
@@ -80,13 +222,15 @@ with st.sidebar:
         else:
             with st.spinner("ドキュメントを処理中..."):
                 try:
-                    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=api_key)
+                    embeddings = OpenAIEmbeddings(model=embedding_model, api_key=api_key, base_url=base_url)
                     
-                    if st.session_state.vector_store is None:
-                        st.session_state.vector_store = Chroma(
-                            persist_directory=PERSIST_DIR,
-                            embedding_function=embeddings
-                        )
+                    st.session_state.vector_store = Chroma(
+                        persist_directory=PERSIST_DIR,
+                        embedding_function=embeddings
+                    )
+                    st.session_state.last_api_key = api_key
+                    st.session_state.last_base_url = base_url
+                    st.session_state.last_embedding_model = embedding_model
                     
                     indexed_files = get_indexed_files()
                     
@@ -113,8 +257,8 @@ with st.sidebar:
                                 doc.metadata["source"] = uploaded_file.name
                             
                             text_splitter = RecursiveCharacterTextSplitter(
-                                chunk_size=1000,
-                                chunk_overlap=100
+                                chunk_size=chunk_size,
+                                chunk_overlap=chunk_overlap
                             )
                             splits = text_splitter.split_documents(docs)
                             st.session_state.vector_store.add_documents(documents=splits)
@@ -131,7 +275,43 @@ with st.sidebar:
     st.divider()
     st.header("🗂️ インデックス済みファイル")
     indexed_files = get_indexed_files()
+    
+    # 統計情報の算出
+    total_pages = 0
+    total_chunks = 0
+    if st.session_state.vector_store is not None:
+        try:
+            data = st.session_state.vector_store.get(include=["metadatas"])
+            metadatas = data.get("metadatas", [])
+            total_chunks = len(metadatas)
+            
+            pages_per_source = {}
+            for meta in metadatas:
+                if meta and "source" in meta and "page" in meta:
+                    source_name = meta["source"]
+                    p_num = meta["page"]
+                    if source_name not in pages_per_source:
+                        pages_per_source[source_name] = set()
+                    pages_per_source[source_name].add(p_num)
+            total_pages = sum(len(pages) for pages in pages_per_source.values())
+        except Exception as e:
+            pass
+
+    # 統計カードの表示
     if indexed_files:
+        st.markdown(f"""
+        <div style="display: flex; gap: 10px; margin-bottom: 15px;">
+            <div style="flex: 1; background: white; padding: 12px; border-radius: 10px; border: 1px solid rgba(0,0,0,0.06); text-align: center; box-shadow: 0 2px 8px rgba(0,0,0,0.01);">
+                <div style="font-size: 0.8rem; color: #64748b; font-weight: 500;">総ページ数</div>
+                <div style="font-size: 1.4rem; color: #6366f1; font-weight: 800; margin-top: 4px;">{total_pages}</div>
+            </div>
+            <div style="flex: 1; background: white; padding: 12px; border-radius: 10px; border: 1px solid rgba(0,0,0,0.06); text-align: center; box-shadow: 0 2px 8px rgba(0,0,0,0.01);">
+                <div style="font-size: 0.8rem; color: #64748b; font-weight: 500;">総チャンク数</div>
+                <div style="font-size: 1.4rem; color: #06b6d4; font-weight: 800; margin-top: 4px;">{total_chunks}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
         for f_name in indexed_files:
             col1, col2 = st.columns([0.8, 0.2])
             with col1:
@@ -160,6 +340,12 @@ for msg in st.session_state.messages:
     elif isinstance(msg, AIMessage):
         with st.chat_message("assistant"):
             st.markdown(msg.content)
+            # 参照元の表示 (st.expander)
+            sources = msg.additional_kwargs.get("sources", [])
+            if sources:
+                with st.expander("🔍 参照元を確認する"):
+                    for src in sources:
+                        st.markdown(src)
 
 if prompt := st.chat_input("質問を入力してください..."):
     if not api_key:
@@ -177,17 +363,26 @@ if prompt := st.chat_input("質問を入力してください..."):
     
     with st.chat_message("assistant"):
         with st.spinner("回答を生成中..."):
-            llm = ChatOpenAI(model="gpt-4o-mini", api_key=api_key, temperature=0)
+            llm = ChatOpenAI(model=selected_model, api_key=api_key, base_url=base_url, temperature=0)
             
             retriever = st.session_state.vector_store.as_retriever(
-                search_kwargs={"k": 4}
+                search_type=search_type,
+                search_kwargs={"k": k_value}
             )
             
-            system_prompt = (
-                "与えられた文脈（Context）のみに基づいて誠実に回答すること。\n"
-                "文脈から判断できない場合は、知ったかぶりをせず「提示されたドキュメントからは分かりませんでした」と回答すること。\n\n"
-                "{context}"
-            )
+            if prompt_mode == "厳格に文書回答":
+                system_prompt = (
+                    "与えられた文脈（Context）のみに基づいて誠実に回答すること。\n"
+                    "文脈から判断できない場合は、知ったかぶりをせず「提示されたドキュメントからは分かりませんでした」と回答すること。\n\n"
+                    "{context}"
+                )
+            else:
+                system_prompt = (
+                    "与えられた文脈（Context）を最も重要な情報源として回答してください。\n"
+                    "もし文脈だけでは質問に十分に答えられない場合は、あなたの持つ一般的な知識も交えて分かりやすく回答してください。\n"
+                    "ただし、文脈に含まれていない一般的な知識に基づく情報を提供する場合は、回答の中で「※提示されたドキュメント以外の知識に基づきます」などの補足を明記してください。\n\n"
+                    "{context}"
+                )
             
             qa_prompt = ChatPromptTemplate.from_messages([
                 ("system", system_prompt),
@@ -224,17 +419,20 @@ if prompt := st.chat_input("質問を入力してください..."):
             answer = response["answer"]
             source_docs = response["context"]
             
+            # 参照元の抽出
+            sources_list = []
             if source_docs:
-                answer += "\n\n**【参照元】**\n"
                 sources = set()
                 for doc in source_docs:
                     source_name = doc.metadata.get("source", "不明なドキュメント")
                     page_num = doc.metadata.get("page", 0) + 1
                     sources.add(f"- {source_name} の {page_num} ページ")
-                
-                for source in sorted(list(sources)):
-                    answer += f"{source}\n"
-                    
-            st.markdown(answer)
+                sources_list = sorted(list(sources))
             
-    st.session_state.messages.append(AIMessage(content=answer))
+            st.markdown(answer)
+            if sources_list:
+                with st.expander("🔍 参照元を確認する"):
+                    for src in sources_list:
+                        st.markdown(src)
+            
+    st.session_state.messages.append(AIMessage(content=answer, additional_kwargs={"sources": sources_list}))
