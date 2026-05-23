@@ -4,6 +4,7 @@
 import streamlit as st
 import os
 import tempfile
+import dotenv
 from langchain_community.document_loaders import PyPDFLoader
 # --- 修正 ---
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -16,10 +17,31 @@ from langchain_classic.chains import create_history_aware_retriever, create_retr
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.messages import HumanMessage, AIMessage
 
+# 環境変数の読み込み
+dotenv.load_dotenv()
+
 # 以下のコードは変更なし
 # --- ページ設定 ---
 st.set_page_config(page_title="RAG Chatbot", page_icon="📄")
 st.title("📄 独自ドキュメント対応チャットボット (RAG)")
+
+# --- 定数とヘルパー関数 ---
+PERSIST_DIR = "./chroma_db"
+
+def get_indexed_files():
+    if st.session_state.vector_store is None:
+        return []
+    try:
+        # Chromaのget()メソッドで全メタデータのソース一覧を取得
+        data = st.session_state.vector_store.get(include=["metadatas"])
+        metadatas = data.get("metadatas", [])
+        sources = set()
+        for meta in metadatas:
+            if meta and "source" in meta:
+                sources.add(meta["source"])
+        return sorted(list(sources))
+    except Exception as e:
+        return []
 
 # --- セッションステートの初期化 ---
 if "messages" not in st.session_state:
@@ -30,48 +52,105 @@ if "vector_store" not in st.session_state:
 # --- サイドバー (ファイル管理・APIキー設定エリア) ---
 with st.sidebar:
     st.header("⚙️ 設定")
-    api_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...")
+    default_api_key = os.environ.get("OPENAI_API_KEY", "")
+    api_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...", value=default_api_key)
+    
+    # ベクトルデータベースの自動読み込み
+    if api_key and st.session_state.vector_store is None:
+        if os.path.exists(PERSIST_DIR) and len(os.listdir(PERSIST_DIR)) > 0:
+            try:
+                embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=api_key)
+                st.session_state.vector_store = Chroma(
+                    persist_directory=PERSIST_DIR,
+                    embedding_function=embeddings
+                )
+            except Exception as e:
+                st.error(f"永続化インデックスの読込エラー: {e}")
+                
     st.divider()
     
     st.header("📂 ドキュメントのアップロード")
-    uploaded_file = st.file_uploader("PDFファイルをアップロードしてください", type="pdf")
+    uploaded_files = st.file_uploader("PDFファイルをアップロードしてください", type="pdf", accept_multiple_files=True)
     
     if st.button("インデックス作成"):
         if not api_key:
             st.error("OpenAI API Keyを入力してください。")
-        elif not uploaded_file:
+        elif not uploaded_files:
             st.error("PDFファイルをアップロードしてください。")
         else:
             with st.spinner("ドキュメントを処理中..."):
                 try:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                        tmp_file.write(uploaded_file.getvalue())
-                        tmp_file_path = tmp_file.name
-                    
-                    loader = PyPDFLoader(tmp_file_path)
-                    docs = loader.load()
-                    
-                    for doc in docs:
-                        doc.metadata["source"] = uploaded_file.name
-                    
-                    text_splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=1000,
-                        chunk_overlap=100
-                    )
-                    splits = text_splitter.split_documents(docs)
-                    
                     embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=api_key)
                     
-                    vector_store = Chroma.from_documents(
-                        documents=splits, 
-                        embedding=embeddings
-                    )
+                    if st.session_state.vector_store is None:
+                        st.session_state.vector_store = Chroma(
+                            persist_directory=PERSIST_DIR,
+                            embedding_function=embeddings
+                        )
                     
-                    st.session_state.vector_store = vector_store
-                    os.remove(tmp_file_path)
-                    st.success("インデックスの作成が完了しました！")
+                    indexed_files = get_indexed_files()
+                    
+                    for uploaded_file in uploaded_files:
+                        # すでに同じ名前のファイルがインデックスされている場合、古い情報を削除
+                        if uploaded_file.name in indexed_files:
+                            try:
+                                data = st.session_state.vector_store.get(where={"source": uploaded_file.name})
+                                ids = data.get("ids", [])
+                                if ids:
+                                    st.session_state.vector_store.delete(ids=ids)
+                            except Exception as e:
+                                pass
+                        
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                            tmp_file.write(uploaded_file.getvalue())
+                            tmp_file_path = tmp_file.name
+                        
+                        try:
+                            loader = PyPDFLoader(tmp_file_path)
+                            docs = loader.load()
+                            
+                            for doc in docs:
+                                doc.metadata["source"] = uploaded_file.name
+                            
+                            text_splitter = RecursiveCharacterTextSplitter(
+                                chunk_size=1000,
+                                chunk_overlap=100
+                            )
+                            splits = text_splitter.split_documents(docs)
+                            st.session_state.vector_store.add_documents(documents=splits)
+                        finally:
+                            if os.path.exists(tmp_file_path):
+                                os.remove(tmp_file_path)
+                                
+                    st.success("インデックスの作成・更新が完了しました！")
+                    st.rerun()
                 except Exception as e:
                     st.error(f"エラーが発生しました: {e}")
+                    
+    # --- インデックス済みファイル一覧 ---
+    st.divider()
+    st.header("🗂️ インデックス済みファイル")
+    indexed_files = get_indexed_files()
+    if indexed_files:
+        for f_name in indexed_files:
+            col1, col2 = st.columns([0.8, 0.2])
+            with col1:
+                st.write(f"📄 {f_name}")
+            with col2:
+                if st.button("🗑️", key=f"del_{f_name}"):
+                    try:
+                        data = st.session_state.vector_store.get(where={"source": f_name})
+                        ids = data.get("ids", [])
+                        if ids:
+                            st.session_state.vector_store.delete(ids=ids)
+                            st.success(f"{f_name} を削除しました。")
+                            st.rerun()
+                        else:
+                            st.warning(f"{f_name} のデータが見つかりませんでした。")
+                    except Exception as e:
+                        st.error(f"削除エラー: {e}")
+    else:
+        st.info("インデックス済みのファイルはありません。")
 
 # --- メイン画面 (チャットエリア) ---
 for msg in st.session_state.messages:
@@ -87,7 +166,7 @@ if prompt := st.chat_input("質問を入力してください..."):
         st.warning("サイドバーでOpenAI API Keyを入力してください。")
         st.stop()
         
-    if st.session_state.vector_store is None:
+    if st.session_state.vector_store is None or not get_indexed_files():
         st.warning("まずはサイドバーからPDFをアップロードし、インデックスを作成してください。")
         st.stop()
         
